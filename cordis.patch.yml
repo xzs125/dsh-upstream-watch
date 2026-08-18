@@ -1,0 +1,16 @@
+# dsh-upstream-watch bundle layer: check upstream deepseek-harness on startup
+# and show a sidebar badge when updates exist.
+- insert:
+    - id: upstream-watch
+      name: dsh-upstream-watch
+      config:
+        # Optional: explicit DSH source checkout dir (must contain .git).
+        # Omitted -> auto-detect (DSH_CHECKOUT env, then known platform paths).
+        # sourceDir: 'E:\Deepseek Harness'
+        # Optional: explicit persisted state file path.
+        # Omitted -> $DSH_HOME/upstream-watch.json (or ~/.dsh/upstream-watch.json).
+        # stateFile: 'E:\Deepseek Harness Data\3081\upstream-watch.json'
+        # Upstream repo used for git remote + GitHub API fallback.
+        # repoUrl: 'https://github.com/deepseek-ai/deepseek-harness'
+        # Timeout (ms) for git/API operations.
+        # timeoutMs: 15000
