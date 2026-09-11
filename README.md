@@ -73,5 +73,5 @@ DSH 插件：启动后自动检查上游 `deepseek-ai/deepseek-harness` 仓库�
 
 ## 维护
 
-- 源码在 WSL `/root/harness/dsh-upstream-watch`，Windows 侧副本 `E:\Agent\dsh-upstream-watch`（两份独立）：改代码需在 WSL 改 + `build` 后同步 `lib/` 产物到副本。
+- 源码在 WSL `/home/git/dsh-upstream-watch`，Windows 侧副本 `E:\Agent\dsh-upstream-watch`（两份独立）：改代码需在 WSL 改 + `build` 后同步 `lib/` 产物到副本。
 - `lib/` 与 `node_modules/` 不入库（`.gitignore`），clone 后需自行构建。

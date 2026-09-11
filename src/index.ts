@@ -43,6 +43,16 @@ export interface Config {
   stateFile?: string
   /** Timeout (ms) for each git/API operation. */
   timeoutMs?: number
+  /** Optional HTTP(S) proxy for git fetch/ls-remote (e.g. http://127.0.0.1:7897). Empty = no override. */
+  gitProxy?: string
+  /** Optional GitHub token to raise API rate limits (falls back to GITHUB_TOKEN env). */
+  githubToken?: string
+  /** Delay (ms) before the very first check; avoids the boot network race. 0 = run immediately. */
+  initialDelayMs?: number
+  /** Backoff sequence (ms) used while checks keep failing; the last entry repeats. */
+  retryBackoffMs?: number[]
+  /** Re-check interval (ms) after a successful check. 0 = check once, never again. */
+  intervalMs?: number
 }
 
 export const Config = z.object({
@@ -50,6 +60,11 @@ export const Config = z.object({
   repoUrl: z.string().default('https://github.com/deepseek-ai/deepseek-harness'),
   stateFile: z.string(),
   timeoutMs: z.number().default(20000),
+  gitProxy: z.string().default(''),
+  githubToken: z.string().default(''),
+  initialDelayMs: z.number().default(8000),
+  retryBackoffMs: z.array(z.number()).default([15000, 30000, 60000, 120000, 300000]),
+  intervalMs: z.number().default(21600000),
 })
 
 /** Config with defaults resolved (apply-time normalization). */
@@ -58,6 +73,11 @@ interface NormalizedConfig {
   repoUrl: string
   stateFile?: string
   timeoutMs: number
+  gitProxy?: string
+  githubToken?: string
+  initialDelayMs: number
+  retryBackoffMs: number[]
+  intervalMs: number
 }
 
 /** Logging shape consumed from the Cordis context. */
@@ -96,6 +116,12 @@ export interface UpstreamState {
   /** De-dup bookmarks: the last upstream state that already triggered a reminder. */
   lastNotifiedTag?: string | null
   lastNotifiedMasterSha?: string | null
+  /** true = the last check failed and an automatic retry is scheduled. */
+  retrying?: boolean
+  /** Consecutive failed checks (0 = the last check succeeded). */
+  consecutiveFailures?: number
+  /** When the next automatic check is planned (ISO), null when none is scheduled. */
+  nextCheckAt?: string | null
 }
 
 interface CheckResult {
@@ -122,8 +148,13 @@ function sendJson(res: import('node:http').ServerResponse, status: number, paylo
 
 const execFileAsync = promisify(execFile)
 
-async function gitRun(sourceDir: string, args: string[], timeoutMs: number): Promise<string> {
-  const { stdout } = await execFileAsync('git', args, {
+async function gitRun(sourceDir: string, args: string[], timeoutMs: number, gitProxy?: string): Promise<string> {
+  // Override the (possibly stale global) proxy for network git commands without
+  // touching ~/.gitconfig: `git -c http.proxy=... -c https.proxy=... <cmd>`.
+  const proxyArgs = gitProxy
+    ? ['-c', `http.proxy=${gitProxy}`, '-c', `https.proxy=${gitProxy}`]
+    : []
+  const { stdout } = await execFileAsync('git', [...proxyArgs, ...args], {
     cwd: sourceDir,
     timeout: timeoutMs,
     maxBuffer: 2 * 1024 * 1024,
@@ -131,16 +162,18 @@ async function gitRun(sourceDir: string, args: string[], timeoutMs: number): Pro
   return String(stdout).trim()
 }
 
-/** Parse `dsh-v0.1.0-rc.7` → [0,1,0,7]; `dsh-v0.1.0` → [0,1,0,Infinity]. */
+/** Parse `dsh-v0.1.5-alpha.1` → [0,1,5,0,1]; `dsh-v0.1.2-rc.1` → [0,1,2,1,1]; `dsh-v0.1.0` → [0,1,0,2,Infinity]. kind: 0=alpha, 1=rc, 2=release. */
 function parseVersion(tag: string): number[] | null {
-  const m = tag.match(/^dsh-v?(\d+)\.(\d+)\.(\d+)(?:-rc\.(\d+))?$/i)
+  const m = tag.match(/^dsh-v?(\d+)\.(\d+)\.(\d+)(?:-(alpha|rc)\.(\d+))?$/i)
   if (!m) return null
-  return [Number(m[1]), Number(m[2]), Number(m[3]), m[4] != null ? Number(m[4]) : Infinity]
+  const kind = m[4] ? (m[4].toLowerCase() === 'alpha' ? 0 : 1) : 2
+  const num = m[5] != null ? Number(m[5]) : Infinity
+  return [Number(m[1]), Number(m[2]), Number(m[3]), kind, num]
 }
 
+/** Compare parsed versions (fixed 5-element arrays: major/minor/patch/kind/num). */
 function compareVersion(a: number[], b: number[]): number {
-  const len = Math.max(a.length, b.length)
-  for (let i = 0; i < len; i++) {
+  for (let i = 0; i < 5; i++) {
     const av = a[i] ?? 0
     const bv = b[i] ?? 0
     if (av !== bv) return av > bv ? 1 : -1
@@ -206,25 +239,25 @@ function saveState(path: string, state: UpstreamState): void {
 /* ------------------------------------------------------------------ */
 
 /** Primary channel: the local git clone (most accurate). */
-async function checkViaGit(sourceDir: string, repoUrl: string, timeoutMs: number): Promise<CheckResult> {
+async function checkViaGit(sourceDir: string, repoUrl: string, timeoutMs: number, gitProxy?: string): Promise<CheckResult> {
   // Fetch remote refs + tags. Only touches .git (FETCH_HEAD / remote-tracking
   // refs / objects); never touches the worktree.
-  await gitRun(sourceDir, ['fetch', 'origin', '--tags', '--quiet', '--prune'], timeoutMs)
+  await gitRun(sourceDir, ['fetch', 'origin', '--tags', '--quiet', '--prune'], timeoutMs, gitProxy)
 
-  const localHead = await gitRun(sourceDir, ['rev-parse', 'HEAD'], timeoutMs)
-  const upstreamMasterSha = await gitRun(sourceDir, ['rev-parse', 'origin/master'], timeoutMs)
-  const ahead = await gitRun(sourceDir, ['rev-list', '--count', 'HEAD..origin/master'], timeoutMs)
+  const localHead = await gitRun(sourceDir, ['rev-parse', 'HEAD'], timeoutMs, gitProxy)
+  const upstreamMasterSha = await gitRun(sourceDir, ['rev-parse', 'origin/master'], timeoutMs, gitProxy)
+  const ahead = await gitRun(sourceDir, ['rev-list', '--count', 'HEAD..origin/master'], timeoutMs, gitProxy)
   const aheadCount = Number(ahead)
 
   // Local version: newest reachable tag.
-  const localVersion = await gitRun(sourceDir, ['describe', '--tags', '--abbrev=0'], timeoutMs).catch(() => '')
+  const localVersion = await gitRun(sourceDir, ['describe', '--tags', '--abbrev=0'], timeoutMs, gitProxy).catch(() => '')
 
   // Remote tags (authoritative, read-only).
-  const tagsOut = await gitRun(sourceDir, ['ls-remote', '--tags', 'origin'], timeoutMs)
+  const tagsOut = await gitRun(sourceDir, ['ls-remote', '--tags', 'origin'], timeoutMs, gitProxy)
   const tags = tagsOut.split('\n').filter(Boolean).map((line) => line.split('\t')[1] ?? '')
 
   // Recent upstream commit titles.
-  const logOut = await gitRun(sourceDir, ['log', 'origin/master', '--oneline', '-5'], timeoutMs)
+  const logOut = await gitRun(sourceDir, ['log', 'origin/master', '--oneline', '-5'], timeoutMs, gitProxy)
   const recentCommits = logOut.split('\n').filter(Boolean).map((line) => {
     const m = line.match(/^(\S+)\s+(.*)$/)
     return { sha: m?.[1] ?? line, title: m?.[2] ?? '' }
@@ -241,13 +274,18 @@ async function checkViaGit(sourceDir: string, repoUrl: string, timeoutMs: number
   }
 }
 
-async function githubFetch(url: string, timeoutMs: number): Promise<Response> {
+async function githubFetch(url: string, timeoutMs: number, githubToken?: string): Promise<Response> {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
   try {
+    const headers: Record<string, string> = {
+      accept: 'application/vnd.github+json',
+      'user-agent': 'dsh-upstream-watch',
+    }
+    if (githubToken) headers.authorization = `Bearer ${githubToken}`
     return await fetch(url, {
       signal: controller.signal,
-      headers: { accept: 'application/vnd.github+json', 'user-agent': 'dsh-upstream-watch' },
+      headers,
     })
   } finally {
     clearTimeout(timer)
@@ -255,13 +293,13 @@ async function githubFetch(url: string, timeoutMs: number): Promise<Response> {
 }
 
 /** Fallback channel: GitHub API (no local git needed). */
-async function checkViaApi(repoUrl: string, timeoutMs: number): Promise<CheckResult> {
+async function checkViaApi(repoUrl: string, timeoutMs: number, githubToken?: string): Promise<CheckResult> {
   const repoPath = repoUrl.replace(/^https:\/\/github\.com\//, '').replace(/\.git$/, '')
   const base = `https://api.github.com/repos/${repoPath}`
 
   const [commitsRes, tagsRes] = await Promise.all([
-    githubFetch(`${base}/commits?sha=master&per_page=5`, timeoutMs),
-    githubFetch(`${base}/tags?per_page=100`, timeoutMs),
+    githubFetch(`${base}/commits?sha=master&per_page=5`, timeoutMs, githubToken),
+    githubFetch(`${base}/tags?per_page=100`, timeoutMs, githubToken),
   ])
   if (!commitsRes.ok || !tagsRes.ok) {
     throw new Error(`GitHub API ${commitsRes.status}/${tagsRes.status}`)
@@ -291,10 +329,10 @@ async function checkViaApi(repoUrl: string, timeoutMs: number): Promise<CheckRes
 }
 
 /** Compute commits-ahead via the GitHub compare API when we know local HEAD. */
-async function apiAheadCount(repoUrl: string, localHead: string, timeoutMs: number): Promise<number | null> {
+async function apiAheadCount(repoUrl: string, localHead: string, timeoutMs: number, githubToken?: string): Promise<number | null> {
   try {
     const repoPath = repoUrl.replace(/^https:\/\/github\.com\//, '').replace(/\.git$/, '')
-    const res = await githubFetch(`https://api.github.com/repos/${repoPath}/compare/${localHead}...master`, timeoutMs)
+    const res = await githubFetch(`https://api.github.com/repos/${repoPath}/compare/${localHead}...master`, timeoutMs, githubToken)
     if (!res.ok) return null
     const data = await res.json() as { ahead_by?: number }
     return typeof data.ahead_by === 'number' ? data.ahead_by : null
@@ -314,30 +352,35 @@ async function runCheck(config: NormalizedConfig, stateFile: string, logger: Log
 
   let result: CheckResult = {}
   let error: string | null = null
+  let gitErrorText: string | null = null
 
   // Channel 1: local git clone.
   if (sourceDir) {
     try {
-      result = await checkViaGit(sourceDir, config.repoUrl, config.timeoutMs)
+      result = await checkViaGit(sourceDir, config.repoUrl, config.timeoutMs, config.gitProxy)
     } catch (gitError) {
-      logger.debug(`[upstream-watch] git channel failed, falling back to API: ${String(gitError)}`)
+      gitErrorText = String((gitError as Error)?.message ?? gitError)
+      logger.debug(`[upstream-watch] git channel failed, falling back to API: ` + gitErrorText)
     }
   }
 
   // Channel 2: GitHub API (also fills in ahead count when local HEAD known).
   if (!result.upstreamMasterSha) {
     try {
-      result = { ...result, ...(await checkViaApi(config.repoUrl, config.timeoutMs)) }
+      result = { ...result, ...(await checkViaApi(config.repoUrl, config.timeoutMs, config.githubToken)) }
       if (sourceDir && !result.localHead) {
         try {
-          result.localHead = await gitRun(sourceDir, ['rev-parse', 'HEAD'], config.timeoutMs)
+          result.localHead = await gitRun(sourceDir, ['rev-parse', 'HEAD'], config.timeoutMs, config.gitProxy)
         } catch { /* read-only best effort */ }
       }
       if (result.localHead && result.upstreamMasterSha) {
-        result.aheadCount = await apiAheadCount(config.repoUrl, result.localHead, config.timeoutMs)
+        result.aheadCount = await apiAheadCount(config.repoUrl, result.localHead, config.timeoutMs, config.githubToken)
       }
     } catch (apiError) {
-      error = String((apiError as Error).message ?? apiError)
+      const apiText = String((apiError as Error)?.message ?? apiError)
+      // Persist BOTH channel failures: a bare "fetch failed" hid the git-side
+      // reason and the previous investigation had to guess at the cause.
+      error = gitErrorText ? 'git: ' + gitErrorText + '; api: ' + apiText : apiText
     }
   }
 
@@ -421,18 +464,203 @@ async function runCheck(config: NormalizedConfig, stateFile: string, logger: Log
 /* plugin entry                                                        */
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/* logging + retry schedule                                            */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Logger that always mirrors info/warn/error to stdout/stderr. The cordis
+ * logger this plugin used before swallowed every line - the journal held zero
+ * upstream-watch entries, so a failed check left no trace to diagnose.
+ */
+function createJournalLogger(base?: Logger): Logger {
+  return {
+    debug: (...args) => { base?.debug?.(...args) },
+    info: (...args) => { base?.info?.(...args); console.log(...args) },
+    warn: (...args) => { base?.warn?.(...args); console.warn(...args) },
+    error: (...args) => { base?.error?.(...args); console.error(...args) },
+  }
+}
+
+/** Timer seam so the retry loop can be exercised without real time. */
+export interface SchedulerTimers {
+  setTimeout: (fn: () => void, ms: number) => unknown
+  clearTimeout: (handle: unknown) => void
+}
+
+export interface SchedulerOptions {
+  /** Performs one check and returns the raw state. */
+  run: () => Promise<UpstreamState>
+  /** Delay before the very first check; avoids the boot network race. */
+  initialDelayMs: number
+  /** Backoff sequence after failures; the last entry repeats. */
+  retryBackoffMs: number[]
+  /** Re-check interval after a successful check; 0 disables periodic re-checks. */
+  intervalMs: number
+  /** Receives every enriched state (retry metadata merged in). */
+  onState: (state: UpstreamState) => void
+  /** Optional extra persistence of the enriched state. */
+  persist?: (state: UpstreamState) => void
+  logger: Logger
+  /** Injectable timers (tests only). */
+  timers?: SchedulerTimers
+}
+
+export interface Scheduler {
+  /** Schedule the first check (never runs synchronously). */
+  start: () => void
+  /** Cancel any pending automatic check. */
+  stop: () => void
+  /** Run a check right now; concurrent callers share one run. */
+  triggerNow: () => Promise<UpstreamState>
+  /** Whether a check is in flight right now. */
+  isRunning: () => boolean
+}
+
+const DEFAULT_TIMERS: SchedulerTimers = {
+  setTimeout: (fn, ms) => setTimeout(fn, ms),
+  clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+}
+
+/**
+ * Owns the check schedule: one delayed first run, exponential backoff while the
+ * check keeps failing, then a slow periodic re-check once it succeeds. Without
+ * this the plugin had exactly one shot at startup, so any transient network
+ * failure (the 2026-09-11 boot race) left the badge purple until the next
+ * DSH restart.
+ */
+export function createScheduler(options: SchedulerOptions): Scheduler {
+  const timers = options.timers ?? DEFAULT_TIMERS
+  const backoff = options.retryBackoffMs.length > 0 ? options.retryBackoffMs : [30000]
+  let timer: unknown = null
+  let stopped = false
+  let failures = 0
+  let inflight: Promise<UpstreamState> | null = null
+
+  const clearTimer = (): void => {
+    if (timer !== null) {
+      timers.clearTimeout(timer)
+      timer = null
+    }
+  }
+
+  const delayForNextRun = (): number => {
+    if (failures === 0) return Math.max(0, options.intervalMs)
+    const index = Math.min(failures - 1, backoff.length - 1)
+    return Math.max(0, backoff[index] ?? 0)
+  }
+
+  const scheduleNext = (delay: number): void => {
+    clearTimer()
+    if (stopped || delay <= 0) return
+    timer = timers.setTimeout(() => {
+      timer = null
+      void runOnce()
+    }, delay)
+  }
+
+  const finish = async (): Promise<UpstreamState> => {
+    let state: UpstreamState
+    try {
+      state = await options.run()
+    } catch (error) {
+      const message = String((error as Error)?.message ?? error)
+      state = { status: 'error', error: message, checkedAt: new Date().toISOString() }
+      options.logger.error('[upstream-watch] unexpected failure: ' + message)
+    }
+
+    if (state.status === 'error') {
+      failures += 1
+      const retryDelay = delayForNextRun()
+      options.logger.warn(
+        '[upstream-watch] 上游更新检查失败（连续 ' + failures + ' 次）：' + (state.error ?? '未知错误') +
+        (retryDelay > 0 ? '；' + Math.round(retryDelay / 1000) + 's 后自动重试' : '；已无重试计划'),
+      )
+    } else if (failures > 0) {
+      options.logger.info('[upstream-watch] 上游更新检查已恢复（此前连续失败 ' + failures + ' 次）。')
+      failures = 0
+    }
+
+    const delay = delayForNextRun()
+    const enriched: UpstreamState = {
+      ...state,
+      retrying: state.status === 'error',
+      consecutiveFailures: failures,
+      nextCheckAt: delay > 0 ? new Date(Date.now() + delay).toISOString() : null,
+    }
+    options.onState(enriched)
+    options.persist?.(enriched)
+    scheduleNext(delay)
+    return enriched
+  }
+
+  async function runOnce(): Promise<UpstreamState> {
+    if (!inflight) {
+      inflight = finish().finally(() => {
+        inflight = null
+      })
+    }
+    return inflight
+  }
+
+  return {
+    start: () => {
+      stopped = false
+      const delay = Math.max(0, options.initialDelayMs)
+      if (delay === 0) {
+        void runOnce()
+        return
+      }
+      scheduleNext(delay)
+    },
+    stop: () => {
+      stopped = true
+      clearTimer()
+    },
+    triggerNow: () => {
+      clearTimer()
+      return runOnce()
+    },
+    isRunning: () => inflight !== null,
+  }
+}
+
 /** Register the status route and kick off the startup check. */
 export function apply(ctx: Context, config: Config): void {
   const webCtx = ctx as WebContext
-  const logger: Logger = (ctx as unknown as { logger?: Logger }).logger ?? console
+  const logger: Logger = createJournalLogger((ctx as unknown as { logger?: Logger }).logger)
   const cfg: NormalizedConfig = {
     sourceDir: config.sourceDir,
     repoUrl: config.repoUrl ?? 'https://github.com/deepseek-ai/deepseek-harness',
     stateFile: config.stateFile,
     timeoutMs: config.timeoutMs ?? 20000,
+    gitProxy: config.gitProxy,
+    githubToken: config.githubToken || process.env.GITHUB_TOKEN,
+    initialDelayMs: config.initialDelayMs ?? 8000,
+    retryBackoffMs: config.retryBackoffMs ?? [15000, 30000, 60000, 120000, 300000],
+    intervalMs: config.intervalMs ?? 21600000,
   }
   const stateFile = resolveStateFile(cfg)
-  const holder: { current: UpstreamState } = { current: { status: 'pending' } }
+
+  // Show the previous result immediately, but never boot up already purple: a
+  // persisted failure means the check is about to be retried, not that the
+  // current run has failed.
+  const previous = loadState(stateFile)
+  const holder: { current: UpstreamState } = {
+    current: previous.status === 'error'
+      ? { ...previous, status: 'pending', retrying: true }
+      : (previous.status ? previous : { status: 'pending' }),
+  }
+
+  const scheduler = createScheduler({
+    run: () => runCheck(cfg, stateFile, logger),
+    initialDelayMs: cfg.initialDelayMs,
+    retryBackoffMs: cfg.retryBackoffMs,
+    intervalMs: cfg.intervalMs,
+    logger,
+    onState: (state) => { holder.current = state },
+    persist: (state) => { saveState(stateFile, state) },
+  })
 
   ctx.effect(() => webCtx.webServer.register({
     kind: 'exact',
@@ -442,11 +670,29 @@ export function apply(ctx: Context, config: Config): void {
     },
   }), 'upstream-watch: GET /api/upstream-watch/status')
 
-  // Fire-and-forget: never block startup on the network check.
-  void runCheck(cfg, stateFile, logger).then((state) => {
-    holder.current = state
-  }).catch((error) => {
-    holder.current = { status: 'error', error: String(error), checkedAt: new Date().toISOString() }
-    logger.error(`[upstream-watch] unexpected failure: ${String(error)}`)
-  })
+  // On-demand re-check: lets the badge (or curl) recover without a DSH restart.
+  ctx.effect(() => webCtx.webServer.register({
+    kind: 'exact',
+    path: '/api/upstream-watch/check',
+    handler: async (req, res) => {
+      if (req.method !== 'POST') {
+        sendJson(res, 405, { error: 'method not allowed; use POST' })
+        return
+      }
+      try {
+        sendJson(res, 200, await scheduler.triggerNow())
+      } catch (error) {
+        sendJson(res, 500, { error: String((error as Error)?.message ?? error) })
+      }
+    },
+  }), 'upstream-watch: POST /api/upstream-watch/check')
+
+  // Delayed first check + backoff retries + periodic re-check, all off the
+  // startup path (never blocks DSH boot).
+  ctx.effect(() => {
+    scheduler.start()
+    return () => scheduler.stop()
+  }, 'upstream-watch: retry schedule')
+
+  logger.debug('[upstream-watch] 首次检查将在 ' + Math.round(cfg.initialDelayMs / 1000) + 's 后进行（避开启动竞态）。')
 }

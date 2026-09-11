@@ -14,3 +14,24 @@
         # repoUrl: 'https://github.com/deepseek-ai/deepseek-harness'
         # Timeout (ms) for git/API operations.
         # timeoutMs: 15000
+        # Optional: HTTP(S) proxy for git fetch/ls-remote, injected per-command
+        # (-c http.proxy / https.proxy) without touching ~/.gitconfig.
+        # The WSL-side proxy below was verified reachable (2026-09-07); the
+        # stale global http://172.27.128.1:7897 is unreachable and caused the
+        # "check failed" (purple) badge.
+        gitProxy: 'http://127.0.0.1:7897'
+        # Optional: GitHub token (PAT) to avoid anonymous API rate limits (403).
+        # Falls back to the GITHUB_TOKEN env var.
+        # githubToken: ''
+        # Self-healing schedule (added 2026-09-11). Before this the plugin
+        # checked exactly once at DSH startup: if that single check landed in
+        # the WSL boot network race it failed, the badge went purple, and it
+        # stayed purple until the next DSH restart. Now a failed check backs
+        # off and retries, a successful one is re-checked periodically, and
+        # POST /api/upstream-watch/check forces a check on demand.
+        # Delay (ms) before the first check; avoids the boot race.
+        # initialDelayMs: 8000
+        # Backoff (ms) after consecutive failures; the last entry repeats.
+        # retryBackoffMs: [15000, 30000, 60000, 120000, 300000]
+        # Re-check interval (ms) once a check succeeds. 0 = never re-check.
+        # intervalMs: 21600000
